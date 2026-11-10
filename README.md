@@ -75,9 +75,8 @@ reserved whether or not the program uses it.
 
 The two Nordic board packages answer for I2C as absent hardware, so the
 build removes the code that follows the first bus read, and their rows are
-the image without the driver's register paths. The feature
-`features/embedded-devex/nordic-twim-i2c-driver.md` in the novo-lang
-repository tracks the missing Nordic I2C driver. The FRDM-MCXN947 board
+the image without the driver's register paths. The novo-lang
+repository tracks the missing Nordic I2C driver as a feature. The FRDM-MCXN947 board
 package drives I2C, and its row is the image with the driver's code in it.
 The driver's own code allocates nothing: every buffer is a fixed-size
 `Vec` in the caller's frame.

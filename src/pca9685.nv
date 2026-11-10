@@ -576,8 +576,8 @@ pub fn channel_read<L: PcaLink>(l: L, ch: Int) -> ?PcaChannel [hw]
     var b: DevBytes = Vec.new()
     if not l.link_read(led_reg(ch, 0), 4, var b)
         return None
-    let on = (b[0] as Int) | (((b[1] as Int) & 0x1F) << 8)
-    let off = (b[2] as Int) | (((b[3] as Int) & 0x1F) << 8)
+    let on = b[0] as Int | ((b[1] as Int & 0x1F) << 8)
+    let off = b[2] as Int | ((b[3] as Int & 0x1F) << 8)
     Some(PcaChannel { on: on, off: off })
 
 // Sets a channel's pulse to start at count `on` and last `width` counts.
@@ -672,7 +672,8 @@ pub fn pwm_init<L: PcaLink>(l: L, osc_hz: Int, ch: Int, hz: Int) -> Bool [hw]
 
 // Reads `n` registers from `reg` in one transaction: the register address
 // is written, then a repeated start reads the bytes back.
-pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                           var dst: DevBytes) -> Bool [hw]
     dev_bus.wiring_read_into(bus, w, reg, n, var dst)
 
 // Writes the bytes of `src` from `reg` in one transaction.

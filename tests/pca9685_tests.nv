@@ -79,7 +79,11 @@ fn power_up(c: Chip)
         c.regs.insert(0x06 + 4 * ch + 3, 0x10)
 
 fn chip() -> Chip
-    let c = Chip { regs: HashMap.new(), st: HashMap.new(), mute: HashMap.new(), deaf: HashMap.new(), log: HashMap.new() }
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        mute: HashMap.new(),
+        deaf: HashMap.new(),
+        log: HashMap.new() }
     c.st.insert(1, 1)
     c.st.insert(9, 0x40)
     power_up(c)
@@ -153,10 +157,10 @@ fn responds(c: Chip, addr: Int) -> Bool
     if addr == hear(c)
         return true
     let m1 = at(c.regs, 0)
-    if (m1 & 0x01) != 0 and addr == at(c.regs, 5) >> 1
+    if (m1 & 0x01) != 0 and addr == (at(c.regs, 5) >> 1)
         return true
     for n in 0..3
-        if (m1 & (0x08 >> n)) != 0 and addr == at(c.regs, 2 + n) >> 1
+        if (m1 & (0x08 >> n)) != 0 and addr == (at(c.regs, 2 + n) >> 1)
             return true
     false
 
@@ -1127,7 +1131,10 @@ fn test_the_part_on_a_board_answers_as_absent_hardware() [io]
     test.assert(not p.sleep())
     test.assert(not p.wake(true))
     test.assert(not p.outputs(true))
-    let q = Pca9685.attach_clock(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_en(dev_bus.wiring_i2c(0, 0x41), 3), 50000000)
+    let q = Pca9685.attach_clock(BoardI2c { id: 0 },
+        BoardGpio { id: 0 },
+        dev_bus.wiring_en(dev_bus.wiring_i2c(0, 0x41), 3),
+        50000000)
     test.assert_eq(q.osc_hz, 50000000)
     test.assert(q.outputs(true))
     let lk = q.as_link()
