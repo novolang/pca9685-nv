@@ -6,9 +6,10 @@
 # The program is a firmware `main`, so it is built as the `main` of a
 # scratch package that depends on this one by path, the way a program on
 # a device depends on it.  The boards are the Nordic nRF52840-DK and
-# nRF54LM20-DK and the NXP FRDM-MCXN947.  Nothing is flashed.  The emulated board's image
-# (nrf52-qemu) is then run under QEMU, where no device answers on the
-# I2C bus, and its first line must be the program's refusal.
+# nRF54LM20-DK and the NXP FRDM-MCXN947.  Nothing is flashed.  The
+# emulated board's image (nrf52-qemu) is then run under QEMU, where no
+# device answers on the I2C bus, and its first line must be the program's
+# refusal.
 #
 # Run from anywhere:  bash tests/device_build.sh
 set -uo pipefail
