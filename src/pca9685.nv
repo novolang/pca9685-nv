@@ -1,0 +1,822 @@
+// pca9685 — NXP's PCA9685, a sixteen-channel, 12-bit PWM controller on an
+// I2C bus, as embedded-hal-nv's `Pwm` per channel, with a servo helper and
+// an LED duty helper.
+//
+// The facts below are from NXP's data sheet "PCA9685: 16-channel, 12-bit
+// PWM Fm+ I2C-bus LED controller", Rev. 4, 16 April 2015.  A section or
+// a table is named where a fact is used.
+//
+// The part has one 12-bit counter, 0 to 4095, that every channel
+// compares against.  A channel has two 12-bit registers, ON and OFF: its
+// output goes high when the counter reaches ON and low when it reaches
+// OFF, so ON sets the phase and OFF - ON the width of the pulse (§ 7.3.3).
+// Bit 4 of the high byte of each register is a full-on bit (ON_H) and a
+// full-off bit (OFF_H); full-off wins if both are set.  All sixteen
+// channels share one frequency, 4096 counts of osc / (prescale + 1).
+//
+// The register map (Table 4):
+//
+//   0x00  MODE1       RESTART (7), EXTCLK (6), AI (5), SLEEP (4),
+//                     SUB1 (3), SUB2 (2), SUB3 (1), ALLCALL (0);
+//                     power-up 0x11
+//   0x01  MODE2       INVRT (4), OCH (3), OUTDRV (2), OUTNE (1:0);
+//                     power-up 0x04
+//   0x02  SUBADR1     power-up 0xE2     0x03  SUBADR2  0xE4
+//   0x04  SUBADR3     power-up 0xE8     0x05  ALLCALLADR  0xE0
+//   0x06  LED0_ON_L   four bytes a channel: ON_L, ON_H, OFF_L, OFF_H,
+//                     to 0x45 (channel 15); OFF_H powers up 0x10 (off)
+//   0xFA  ALL_LED_ON_L   ON_L, ON_H, OFF_L, OFF_H of every channel at once
+//   0xFE  PRE_SCALE   power-up 0x1E (200 Hz at 25 MHz); writable only
+//                     while SLEEP is set (Table 8, note 1)
+//
+// The rules of the part that shape this driver:
+//
+//  - Register auto-increment (MODE1.AI) is off at power-up.  The four
+//    bytes of a channel go out in one transaction, so `start` turns AI on
+//    and the channel writes depend on it.  A software reset turns it off.
+//  - A change to the prescale needs SLEEP set, and the oscillator takes
+//    500 us after SLEEP is cleared before the outputs are valid (Table 5,
+//    note 2).  Both waits go through the link.
+//  - Setting SLEEP while a channel runs sets MODE1.RESTART at the end of
+//    the PWM cycle.  Writing 1 to RESTART after the oscillator is back
+//    restarts the channels from the registers' contents and clears the
+//    bit (§ 7.3.1.1).  A read-modify-write of MODE1 that writes back a
+//    RESTART it has read as 1 therefore restarts the part: every write of
+//    MODE1 here masks RESTART out, and `wake` writes it on purpose.
+//  - With MODE2.OCH set, a channel's outputs change on the acknowledge of
+//    the last register, and only once all four are loaded (Table 6, note
+//    3).  A one-byte write to one of the four would not take effect, so
+//    the driver always writes a channel's four registers together.
+//  - ON and OFF must never be programmed with the same count (§ 7.3.4),
+//    so a duty of zero is the full-off bit and not an empty pulse.
+//
+// Drivers read for their fixes, nothing ported: Zephyr's
+// `drivers/pwm/pwm_pca9685.c`, Linux's `drivers/pwm/pwm-pca9685.c`,
+// Adafruit's `Adafruit_PWMServoDriver` and the `pwm-pca9685` crate
+// (eldruin).  Each fix kept is named at its site.
+//
+// The driver keeps no state: the prescale and the channel registers are
+// read from the part when they are needed.  The bus, the timer and the OE
+// pin enter through `PcaLink`, which `Pca9685Link` implements over a
+// board's handles and a test implements over a double of the part.
+
+use embedded_hal.{ BoardI2c, BoardGpio, BoardTimer, I2cBus, GpioOut, Timer, Pwm }
+use dev_bus.{ DeviceWiring, DevBytes }
+
+// The registers.
+let REG_MODE1    = 0x00
+let REG_MODE2    = 0x01
+let REG_SUBADR1  = 0x02
+let REG_ALLCALL  = 0x05
+let REG_LED0     = 0x06
+let REG_ALL_LED  = 0xFA
+let REG_PRESCALE = 0xFE
+
+// MODE1.
+let MODE1_RESTART = 0x80
+let MODE1_EXTCLK  = 0x40
+let MODE1_AI      = 0x20
+let MODE1_SLEEP   = 0x10
+let MODE1_SUBS    = 0x0E
+let MODE1_ALLCALL = 0x01
+
+// MODE2.
+let MODE2_INVRT  = 0x10
+let MODE2_OCH    = 0x08
+let MODE2_OUTDRV = 0x04
+
+// The full-on and full-off bits, bit 4 of the high byte, as bit 12 of
+// the 13-bit words this driver calls ON and OFF.
+let FULL_BIT  = 0x1000
+let COUNT_MAX = 0x0FFF
+
+// The address bytes the part answers to after a software reset: the
+// general-call byte that follows address 0 (§ 7.6).
+let SWRST_BYTE = 0x06
+
+// The fastest I2C clock the part takes in Fast-mode Plus is 1 MHz; the
+// driver asks for fast mode, which every board's bus does.
+let I2C_HZ = 400000
+
+// The oscillator takes 500 us to run after SLEEP is cleared.
+let OSC_WAIT_US = 500
+
+// The oscillator of the part when MODE1.EXTCLK is clear, in hertz.
+pub const PCA9685_OSC_INTERNAL_HZ = 25000000
+
+// The fastest external clock the part takes, in hertz.
+pub const PCA9685_OSC_MAX_HZ = 50000000
+
+// The counts in one PWM period.
+pub const PCA9685_STEPS = 4096
+
+// The channel number that addresses the ALL_LED registers: a write to it
+// reaches all sixteen channels.
+pub const PCA9685_ALL = 16
+
+// The prescale the part accepts: the hardware forces a minimum of 3 and
+// the register holds 255 at most (§ 7.3.5).
+let PRESCALE_MIN = 3
+let PRESCALE_MAX = 255
+
+// ── What the part is told at start ───────────────────────────────────
+
+// The settings `start` writes.  `freq_hz` is the PWM frequency, 24 to
+// 1526 Hz at the internal oscillator.  `ext_clk` takes the clock from
+// the EXTCLK pin, whose frequency is the `osc_hz` the driver was given.
+// `totem_pole` selects the totem-pole output driver, `invert` inverts
+// the outputs, `och_on_ack` makes the outputs change on the acknowledge
+// of a channel's last register and not on the stop condition, and
+// `outne` is the level of the outputs while OE is high: 0 low, 1 high
+// for a totem pole and high impedance for an open drain, 2 or 3 high
+// impedance.  `allcall` and `subs` choose which extra addresses the
+// part answers: ALLCALL and a mask of SUB1 (bit 0) to SUB3 (bit 2).
+// `keep_outputs` leaves the channel registers as the part holds them and
+// restarts the channels that were running.
+pub @value
+struct Pca9685Config
+    freq_hz: Int
+    ext_clk: Bool
+    totem_pole: Bool
+    invert: Bool
+    och_on_ack: Bool
+    outne: Int
+    allcall: Bool
+    subs: Int
+    keep_outputs: Bool
+
+// The settings `start` uses when the program names none: 200 Hz, the
+// part's own default, the totem-pole driver, no inversion, outputs that
+// change on the stop condition, and no all-call or sub-address.
+//
+// Fix kept: the all-call address is off.  The part answers address 0x70
+// after power-up, which collides with an I2C multiplexer or another
+// device at that address; Linux's driver turns it off for that reason.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     let c = pca9685.config_default()
+//     println("${c.freq_hz} ${c.allcall}")   // 200 false
+// ```
+pub fn config_default() -> Pca9685Config
+    config_at(200)
+
+// The default settings at the PWM frequency `hz`, which a servo program
+// sets to 50.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     let c = pca9685.config_at(50)
+//     println("${c.freq_hz} ${c.totem_pole}")   // 50 true
+// ```
+pub fn config_at(hz: Int) -> Pca9685Config
+    Pca9685Config { freq_hz: hz, ext_clk: false, totem_pole: true, invert: false,
+                    och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                    keep_outputs: false }
+
+// ── The link ─────────────────────────────────────────────────────────
+
+// What the driver needs from the board: the registers over the bus, the
+// general-call write, a wait in microseconds, and the OE pin.  A board's
+// handles implement it as `Pca9685Link`; a test implements it over a
+// double of the part.  `link_read` reads `n` registers from `reg` in one
+// transaction; `link_write` writes the bytes of `src` from `reg` in one
+// transaction; `link_call` writes one byte to the general-call address;
+// `link_output` drives the OE pin, low to enable the outputs, and
+// answers `false` for a wiring with no OE pin; `link_setup` makes the
+// bus and the OE pin ready.
+pub trait PcaLink
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+    fn link_call(self, byte: Int) -> Bool [hw]
+    fn link_wait(self, us: Int) [hw]
+    fn link_output(self, enable: Bool) -> Bool [hw]
+    fn link_setup(self) [hw]
+
+// ── Computations ─────────────────────────────────────────────────────
+
+// The prescale register value for a PWM frequency, by the data sheet's
+// formula (§ 7.3.5): `round(osc / (4096 * freq)) - 1`.  The rounding is
+// to the nearest, halves up, in integers.  Answers -1 for a frequency or
+// an oscillator that is not positive and for a value outside 3 to 255,
+// the range the part takes.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     println("${pca9685.prescale_for(25000000, 200)}")    // 30
+//     println("${pca9685.prescale_for(25000000, 50)}")     // 121
+//     println("${pca9685.prescale_for(25000000, 2000)}")   // -1
+// ```
+pub fn prescale_for(osc_hz: Int, freq_hz: Int) -> Int
+    if osc_hz <= 0 or freq_hz <= 0
+        return -1
+    let d = PCA9685_STEPS * freq_hz
+    let p = (2 * osc_hz + d) / (2 * d) - 1
+    if p < PRESCALE_MIN or p > PRESCALE_MAX
+        return -1
+    p
+
+// The PWM frequency a prescale gives, in hertz, rounded to the nearest:
+// `osc / (4096 * (prescale + 1))`.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     println("${pca9685.frequency_of(25000000, 30)}")    // 197
+//     println("${pca9685.frequency_of(25000000, 255)}")   // 24
+//     println("${pca9685.frequency_of(25000000, 3)}")     // 1526
+// ```
+pub fn frequency_of(osc_hz: Int, prescale: Int) -> Int
+    let d = PCA9685_STEPS * (prescale + 1)
+    (2 * osc_hz + d) / (2 * d)
+
+// The period of the PWM signal for a prescale, in microseconds, rounded
+// to the nearest.
+pub fn period_us_of(osc_hz: Int, prescale: Int) -> Int
+    if osc_hz <= 0
+        return 0
+    let d = PCA9685_STEPS * (prescale + 1) * 1000000
+    (d + osc_hz / 2) / osc_hz
+
+// The width in counts of a duty cycle in parts per thousand: 0 to 4096,
+// rounded to the nearest count.  A duty of 1000 is 4096, which a channel
+// writes as the full-on bit.  A duty outside 0 to 1000 is held to it.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     println("${pca9685.duty_counts(500)}")    // 2048
+//     println("${pca9685.duty_counts(1000)}")   // 4096
+// ```
+pub fn duty_counts(permille: Int) -> Int
+    if permille <= 0
+        return 0
+    if permille >= 1000
+        return PCA9685_STEPS
+    (permille * PCA9685_STEPS + 500) / 1000
+
+// The width in counts of a pulse of `us` microseconds at the prescale
+// `prescale`: the counter runs at `osc / (prescale + 1)`, so a count is
+// `(prescale + 1) / osc` seconds.  Rounded to the nearest count, and 0
+// for a pulse that is not positive.  A result of 4096 or more is a pulse
+// as long as the period or longer.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     // 1500 us at 50 Hz (prescale 121): 307 counts.
+//     println("${pca9685.pulse_counts(1500, 25000000, 121)}")   // 307
+// ```
+pub fn pulse_counts(us: Int, osc_hz: Int, prescale: Int) -> Int
+    if us <= 0 or osc_hz <= 0
+        return 0
+    let den = (prescale + 1) * 1000000
+    (us * osc_hz + den / 2) / den
+
+// The pulse width in microseconds that puts a hobby servo at `angle_deg`
+// of its `range_deg` of travel, with `min_us` at 0 degrees and `max_us` at
+// `range_deg`.  The angle is held to 0 to `range_deg`.  The usual pulse
+// is 1000 to 2000 us, and servos differ, so the caller names the ends.
+//
+// ```novo
+// use pca9685
+//
+// fn main() [io]
+//     println("${pca9685.servo_us_of(90, 180, 1000, 2000)}")   // 1500
+//     println("${pca9685.servo_us_of(45, 180, 500, 2500)}")    // 1000
+// ```
+pub fn servo_us_of(angle_deg: Int, range_deg: Int, min_us: Int, max_us: Int) -> Int
+    if range_deg <= 0
+        return min_us
+    var a = angle_deg
+    if a < 0
+        a = 0
+    if a > range_deg
+        a = range_deg
+    min_us + (max_us - min_us) * a / range_deg
+
+// The register address of byte `i` (0 ON_L, 1 ON_H, 2 OFF_L, 3 OFF_H) of
+// channel `ch`, 0 to 15, or of the ALL_LED registers for 16.
+fn led_reg(ch: Int, i: Int) -> Int
+    if ch >= PCA9685_ALL
+        return REG_ALL_LED + i
+    REG_LED0 + 4 * ch + i
+
+// The four bytes of the channel registers for an ON word and an OFF
+// word, each of which carries its full bit as bit 12.
+fn put_channel(var b: DevBytes, on: Int, off: Int)
+    b.clear()
+    let _ = b.push((on & 0xFF) as u8)
+    let _ = b.push(((on >> 8) & 0x1F) as u8)
+    let _ = b.push((off & 0xFF) as u8)
+    let _ = b.push(((off >> 8) & 0x1F) as u8)
+
+// ── Register access, over any link ───────────────────────────────────
+
+// One register, or `None` when the part does not answer.
+pub fn reg_read<L: PcaLink>(l: L, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not l.link_read(reg, 1, var b)
+        return None
+    Some(b[0] as Int)
+
+// Writes one register: whether the part acknowledged.
+pub fn reg_write<L: PcaLink>(l: L, reg: Int, v: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let _ = b.push((v & 0xFF) as u8)
+    l.link_write(reg, b)
+
+// MODE1 written with RESTART masked out, so a read-modify-write that
+// read RESTART as 1 does not restart the part.
+fn mode1_write<L: PcaLink>(l: L, v: Int) -> Bool [hw]
+    reg_write(l, REG_MODE1, v & (0xFF ^ MODE1_RESTART))
+
+// The prescale written and read back.  The part ignores a write while
+// SLEEP is clear and acknowledges it all the same, so only a read shows
+// whether it took it.
+fn prescale_write<L: PcaLink>(l: L, p: Int) -> Bool [hw]
+    if not reg_write(l, REG_PRESCALE, p)
+        return false
+    reg_read(l, REG_PRESCALE) == Some(p)
+
+// MODE1, or `None`.
+pub fn mode1_read<L: PcaLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_MODE1)
+
+// MODE2, or `None`.
+pub fn mode2_read<L: PcaLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_MODE2)
+
+// The prescale register, or `None`.
+pub fn prescale_read<L: PcaLink>(l: L) -> ?Int [hw]
+    reg_read(l, REG_PRESCALE)
+
+// ── Start, sleep and wake ────────────────────────────────────────────
+
+// The MODE2 byte for a configuration.
+fn mode2_of(c: Pca9685Config) -> Int
+    var m = c.outne & 3
+    if c.totem_pole
+        m = m | MODE2_OUTDRV
+    if c.invert
+        m = m | MODE2_INVRT
+    if c.och_on_ack
+        m = m | MODE2_OCH
+    m
+
+// The MODE1 bits of a mask of sub-addresses, SUB1 in bit 0 of the mask:
+// SUB1 is bit 3 of MODE1, SUB2 bit 2 and SUB3 bit 1.
+fn sub_bits(subs: Int) -> Int
+    ((subs & 1) << 3) | ((subs & 2) << 1) | ((subs & 4) >> 1)
+
+// The MODE1 byte, with SLEEP clear, for a configuration: auto-increment,
+// the all-call bit, and the sub-address bits SUB1 to SUB3 for bits 0 to
+// 2 of `subs`.
+fn mode1_of(c: Pca9685Config) -> Int
+    var m = MODE1_AI | sub_bits(c.subs)
+    if c.allcall
+        m = m | MODE1_ALLCALL
+    m
+
+// Brings the part up with the settings `c`, for an oscillator of
+// `osc_hz`.  The sequence is the data sheet's: auto-increment on and
+// SLEEP set; the external clock switched in, if asked, while asleep
+// (the switch needs SLEEP set, and EXTCLK clears only on a power cycle
+// or a reset, Table 5); MODE2; the prescale, checked by a read; all
+// outputs off unless `keep_outputs`; then SLEEP clear, the 500 us wait
+// for the oscillator, and a restart of the channels that were running if
+// `keep_outputs`.  The OE pin, if the wiring has one, is held high
+// while the part is configured and driven low at the end.
+//
+// Answers 0 when the part took everything, -1 when it does not answer, -2
+// when a write was refused or the prescale did not stick, and -3 when
+// the frequency is outside what the oscillator gives (24 to 1526 Hz at
+// 25 MHz).
+pub fn start<L: PcaLink>(l: L, osc_hz: Int, c: Pca9685Config) -> Int [hw]
+    let p = prescale_for(osc_hz, c.freq_hz)
+    if p < 0
+        return -3
+    l.link_setup()
+    if mode1_read(l) == None
+        return -1
+    let base = mode1_of(c)
+    if not mode1_write(l, base | MODE1_SLEEP)
+        return -2
+    // RESTART is set by the part when SLEEP is set over a running channel.
+    let m = mode1_read(l) ?? 0
+    let restart = (m & MODE1_RESTART) != 0
+    var run = base
+    if c.ext_clk
+        if not mode1_write(l, base | MODE1_SLEEP | MODE1_EXTCLK)
+            return -2
+        run = base | MODE1_EXTCLK
+    if not reg_write(l, REG_MODE2, mode2_of(c))
+        return -2
+    if not prescale_write(l, p)
+        return -2
+    if not c.keep_outputs
+        if not channel_off(l, PCA9685_ALL)
+            return -2
+    if not mode1_write(l, run)
+        return -2
+    if not c.ext_clk
+        l.link_wait(OSC_WAIT_US)
+    if c.keep_outputs and restart
+        if not reg_write(l, REG_MODE1, run | MODE1_RESTART)
+            return -2
+    let _ = l.link_output(true)
+    0
+
+// Sets the PWM frequency of the whole part to the nearest `hz` its
+// prescale gives, for an oscillator of `osc_hz`.  The part is put to
+// sleep, the prescale written and read back, and the part woken again if
+// it was awake, with the 500 us wait and, if the channels were running,
+// the restart.  The outputs stop for the time the oscillator is off.
+//
+// Fix kept: MODE1 is read and written back with RESTART masked out, and
+// the bits it holds (AI, EXTCLK, the address bits) are kept; Adafruit's
+// `setPWMFreq` and the `pwm-pca9685` crate do the same.  The RESTART
+// that SLEEP sets over a running channel is read after the sleep write
+// and written back at the end, as Zephyr's `set_pre_scale` does, so a
+// running servo resumes.
+//
+// Answers 0 on success, -1 when the part does not answer, -2 when a
+// write was refused or the prescale did not stick, -3 when `hz` is
+// outside the range.
+pub fn set_frequency<L: PcaLink>(l: L, osc_hz: Int, hz: Int) -> Int [hw]
+    let p = prescale_for(osc_hz, hz)
+    if p < 0
+        return -3
+    let Some(m) = mode1_read(l) else return -1
+    let was_awake = (m & MODE1_SLEEP) == 0
+    let keep = m & (0xFF ^ MODE1_RESTART)
+    if was_awake
+        if not mode1_write(l, keep | MODE1_SLEEP)
+            return -2
+    let restart = ((mode1_read(l) ?? 0) & MODE1_RESTART) != 0
+    if not prescale_write(l, p)
+        return -2
+    if was_awake
+        if not mode1_write(l, keep)
+            return -2
+        l.link_wait(OSC_WAIT_US)
+        if restart
+            if not reg_write(l, REG_MODE1, keep | MODE1_RESTART)
+                return -2
+    0
+
+// Puts the part to sleep: the oscillator stops and the outputs hold
+// their registers.  Whether the part took the write.
+pub fn sleep<L: PcaLink>(l: L) -> Bool [hw]
+    let Some(m) = mode1_read(l) else return false
+    mode1_write(l, m | MODE1_SLEEP)
+
+// Wakes the part: SLEEP clear, the 500 us wait, and, when `restart` is
+// true and the part holds a pending RESTART, the restart of the channels
+// that were running.  Whether the part took the writes.
+pub fn wake<L: PcaLink>(l: L, restart: Bool) -> Bool [hw]
+    let Some(m) = mode1_read(l) else return false
+    let awake = m & (0xFF ^ (MODE1_RESTART | MODE1_SLEEP))
+    if not mode1_write(l, awake)
+        return false
+    l.link_wait(OSC_WAIT_US)
+    if restart and (m & MODE1_RESTART) != 0
+        return reg_write(l, REG_MODE1, awake | MODE1_RESTART)
+    true
+
+// Resets every PCA9685 on the bus with the software-reset call: the byte
+// 0x06 to the general-call address (§ 7.6).  The parts return to their
+// power-up state, asleep, auto-increment off, every channel off.  Whether
+// the bus acknowledged.
+pub fn software_reset<L: PcaLink>(l: L) -> Bool [hw]
+    l.link_call(SWRST_BYTE)
+
+// Drives the OE pin: outputs enabled when `on` is true.  Whether the
+// wiring has an OE pin.
+pub fn output_enable<L: PcaLink>(l: L, on: Bool) -> Bool [hw]
+    l.link_output(on)
+
+// ── Addresses ────────────────────────────────────────────────────────
+
+// Sets the address the part answers to as the all-call address, 7 bits
+// (power-up 0x70).  Whether the part took it.
+pub fn set_allcall_address<L: PcaLink>(l: L, addr: Int) -> Bool [hw]
+    reg_write(l, REG_ALLCALL, (addr & 0x7F) << 1)
+
+// Sets the sub-address `n`, 1 to 3, to the 7-bit `addr` (power-up
+// 0x71, 0x72 and 0x74).  Whether the part took it; `false` for an `n`
+// outside 1 to 3.
+pub fn set_subaddress<L: PcaLink>(l: L, n: Int, addr: Int) -> Bool [hw]
+    if n < 1 or n > 3
+        return false
+    reg_write(l, REG_SUBADR1 + n - 1, (addr & 0x7F) << 1)
+
+// Chooses which extra addresses the part answers: the all-call address
+// when `allcall` is true, and the sub-addresses in `subs`, a mask with
+// SUB1 in bit 0.  The rest of MODE1 is kept.  Whether the part took it.
+pub fn set_responses<L: PcaLink>(l: L, allcall: Bool, subs: Int) -> Bool [hw]
+    let Some(m) = mode1_read(l) else return false
+    var next = (m & (0xFF ^ (MODE1_SUBS | MODE1_ALLCALL))) | sub_bits(subs)
+    if allcall
+        next = next | MODE1_ALLCALL
+    mode1_write(l, next)
+
+// The all-call address as a 7-bit address, or `None`.
+pub fn allcall_address<L: PcaLink>(l: L) -> ?Int [hw]
+    let Some(v) = reg_read(l, REG_ALLCALL) else return None
+    Some(v >> 1)
+
+// ── Channels ─────────────────────────────────────────────────────────
+
+// The registers of one channel: the ON word and the OFF word, each the
+// 12-bit count with the full bit as bit 12.
+pub @value
+struct PcaChannel
+    on: Int
+    off: Int
+
+// Whether the channel's output is always on: the full-on bit is set and
+// the full-off bit is clear.
+pub fn channel_is_full_on(c: PcaChannel) -> Bool
+    (c.on & FULL_BIT) != 0 and (c.off & FULL_BIT) == 0
+
+// Whether the channel's output is always off: the full-off bit is set.
+pub fn channel_is_full_off(c: PcaChannel) -> Bool
+    (c.off & FULL_BIT) != 0
+
+// Writes the registers of channel `ch`, 0 to 15, or of all sixteen for
+// `PCA9685_ALL`, as the ON word and the OFF word of `PcaChannel`, in one
+// transaction of four bytes.  Whether the part acknowledged; `false` for
+// a channel outside 0 to 16.
+//
+// The transaction is four bytes after the register address, so it needs
+// the auto-increment `start` turns on.
+pub fn channel_set<L: PcaLink>(l: L, ch: Int, on: Int, off: Int) -> Bool [hw]
+    if ch < 0 or ch > PCA9685_ALL
+        return false
+    var b: DevBytes = Vec.new()
+    put_channel(var b, on, off)
+    l.link_write(led_reg(ch, 0), b)
+
+// The registers of channel `ch`, 0 to 15, read in one transaction, or
+// `None` when the part does not answer or the channel is outside 0 to 15
+// (the ALL_LED registers read as zero, so they are not read).
+pub fn channel_read<L: PcaLink>(l: L, ch: Int) -> ?PcaChannel [hw]
+    if ch < 0 or ch >= PCA9685_ALL
+        return None
+    var b: DevBytes = Vec.new()
+    if not l.link_read(led_reg(ch, 0), 4, var b)
+        return None
+    let on = (b[0] as Int) | (((b[1] as Int) & 0x1F) << 8)
+    let off = (b[2] as Int) | (((b[3] as Int) & 0x1F) << 8)
+    Some(PcaChannel { on: on, off: off })
+
+// Sets a channel's pulse to start at count `on` and last `width` counts.
+// A `width` of 0 or less is the full-off bit, 4096 or more the full-on
+// bit, and in between the OFF count is `on + width` wrapped to 12 bits,
+// as the data sheet's examples do (§ 7.3.3).  `on` is held to 12 bits.
+// Whether the part acknowledged.
+//
+// Fix kept: a zero width is the full-off bit and not an equal ON and OFF
+// count, which the data sheet forbids; Zephyr's and Linux's drivers write
+// full-off for it.
+pub fn channel_pulse<L: PcaLink>(l: L, ch: Int, on: Int, width: Int) -> Bool [hw]
+    let start = on & COUNT_MAX
+    if width <= 0
+        return channel_set(l, ch, 0, FULL_BIT)
+    if width >= PCA9685_STEPS
+        return channel_set(l, ch, start | FULL_BIT, 0)
+    channel_set(l, ch, start, (start + width) & COUNT_MAX)
+
+// Sets a channel's duty cycle in parts per thousand, 0 to 1000, with the
+// pulse starting at count 0.  This is the LED helper, and what
+// `Pwm.set_duty` calls.  The duty is rounded to the nearest of 4096
+// counts.  Whether the part acknowledged.
+pub fn channel_duty<L: PcaLink>(l: L, ch: Int, permille: Int) -> Bool [hw]
+    channel_pulse(l, ch, 0, duty_counts(permille))
+
+// Turns a channel, or all of them for `PCA9685_ALL`, off with the
+// full-off bit.  Whether the part acknowledged.
+pub fn channel_off<L: PcaLink>(l: L, ch: Int) -> Bool [hw]
+    channel_pulse(l, ch, 0, 0)
+
+// Stops a channel's output and keeps its counts, so `channel_enable`
+// resumes it: the full-off bit is set and the other bits are written
+// back.  The four registers are written together, so the change takes
+// effect with MODE2.OCH set too.  Whether the part acknowledged.
+pub fn channel_disable<L: PcaLink>(l: L, ch: Int) -> Bool [hw]
+    let Some(c) = channel_read(l, ch) else return false
+    channel_set(l, ch, c.on, c.off | FULL_BIT)
+
+// Resumes a channel stopped by `channel_disable`: the full-off bit is
+// cleared.  A channel whose OFF count is 0 with no full-on bit has a duty
+// of 0, and stays off.  Whether the part acknowledged.
+pub fn channel_enable<L: PcaLink>(l: L, ch: Int) -> Bool [hw]
+    let Some(c) = channel_read(l, ch) else return false
+    let off = c.off & COUNT_MAX
+    if off == 0 and (c.on & FULL_BIT) == 0
+        return channel_set(l, ch, c.on, FULL_BIT)
+    channel_set(l, ch, c.on, off)
+
+// Sets a servo's pulse on channel `ch` to `us` microseconds, at the
+// prescale the part holds, which is read first.  Answers `false` when
+// the part does not answer or when the pulse is as long as the period or
+// longer, which no servo takes as a pulse.
+//
+// The pulse starts at count 0, so servos on several channels all rise
+// together; `channel_pulse` with a different `on` per channel staggers
+// them to spread the current.
+pub fn servo_us<L: PcaLink>(l: L, osc_hz: Int, ch: Int, us: Int) -> Bool [hw]
+    let Some(p) = prescale_read(l) else return false
+    let w = pulse_counts(us, osc_hz, p)
+    if w >= PCA9685_STEPS
+        return false
+    channel_pulse(l, ch, 0, w)
+
+// The PWM frequency in hertz the part runs at now, from the prescale it
+// holds, or 0 when the part does not answer.
+pub fn frequency_read<L: PcaLink>(l: L, osc_hz: Int) -> Int [hw]
+    match prescale_read(l)
+        Some(p) => frequency_of(osc_hz, p)
+        None    => 0
+
+// What `Pwm.init` does: checks the channel, 0 to 15, and sets the
+// frequency of the whole part when it differs from the one the prescale
+// gives now.  The part has one frequency for all channels, so a second
+// channel started at another frequency moves the first.  Answers `true`
+// when the part runs at the requested frequency afterwards.
+pub fn pwm_init<L: PcaLink>(l: L, osc_hz: Int, ch: Int, hz: Int) -> Bool [hw]
+    if ch < 0 or ch >= PCA9685_ALL
+        return false
+    let p = prescale_for(osc_hz, hz)
+    if p < 0
+        return false
+    let Some(now) = prescale_read(l) else return false
+    if now == p
+        return true
+    set_frequency(l, osc_hz, hz) == 0
+
+// ── The link over a board's handles ──────────────────────────────────
+
+// The bus and pin framing as functions over the traits, so a test runs
+// them over a double of the part.
+
+// Reads `n` registers from `reg` in one transaction: the register address
+// is written, then a repeated start reads the bytes back.
+pub fn i2c_read<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// Writes the bytes of `src` from `reg` in one transaction.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Writes one byte to the general-call address, 0 (§ 7.6).
+pub fn i2c_call<B: I2cBus>(bus: B, byte: Int) -> Bool [hw]
+    system
+        return bus.write(0, [byte as u8])
+
+// Drives the OE pin, which is active low: low enables the outputs.
+// Answers `false` for a wiring with no OE pin.
+pub fn oe_drive<G: GpioOut>(pins: G, w: DeviceWiring, enable: Bool) -> Bool [hw]
+    let Some(oe) = w.en else return false
+    if enable
+        pins.set(oe, 0)
+    else
+        pins.set(oe, 1)
+    true
+
+// Makes the bus and the OE pin ready: the bus at 400 kHz, and the OE pin
+// high, which disables the outputs, before it becomes an output, so the
+// pin never drives low until the part is configured.
+pub fn link_ready<B: I2cBus, G: GpioOut>(bus: B, pins: G, w: DeviceWiring) [hw]
+    bus.init(I2C_HZ)
+    if let Some(oe) = w.en
+        pins.set(oe, 1)
+        pins.mode(oe, 1)
+
+// The link over a board's I2C bus, GPIO and timer.  The wiring names the
+// address (`w.addr`, 0x40 to 0x7F with the address pins) and, as `w.en`,
+// the pin the OE input is wired to.
+pub @value
+struct Pca9685Link
+    bus: BoardI2c
+    pins: BoardGpio
+    timer: BoardTimer
+    w: DeviceWiring
+
+impl PcaLink for Pca9685Link
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read(self.bus, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, src)
+
+    fn link_call(self, byte: Int) -> Bool [hw]
+        i2c_call(self.bus, byte)
+
+    fn link_wait(self, us: Int) [hw]
+        self.timer.delay_us(us)
+
+    fn link_output(self, enable: Bool) -> Bool [hw]
+        oe_drive(self.pins, self.w, enable)
+
+    fn link_setup(self) [hw]
+        link_ready(self.bus, self.pins, self.w)
+
+// ── The part on a board ──────────────────────────────────────────────
+
+// A PCA9685 on a board's I2C bus at the address `w.addr`, with the
+// oscillator it runs from.
+pub @value
+struct Pca9685
+    link: Pca9685Link
+    osc_hz: Int
+
+impl Pca9685
+    // The part at `w.addr` on the board's bus, on its internal 25 MHz
+    // oscillator, as a board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Pca9685
+        Pca9685 { link: Pca9685Link { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w },
+                  osc_hz: PCA9685_OSC_INTERNAL_HZ }
+
+    // The part with an external clock of `osc_hz` on the EXTCLK pin.
+    // `start` switches to it when the configuration asks (`ext_clk`).
+    fn attach_clock(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring, osc_hz: Int) -> Pca9685
+        Pca9685 { link: Pca9685Link { bus: bus, pins: pins, timer: BoardTimer { id: 0 }, w: w },
+                  osc_hz: osc_hz }
+
+    // The link, for the functions of this module that take one.
+    fn as_link(self) -> Pca9685Link
+        self.link
+
+    // Brings the part up with the default settings (`config_default`):
+    // whether it took them.
+    fn begin(self) -> Bool [hw]
+        start(self.link, self.osc_hz, config_default()) == 0
+
+    // Brings the part up with the settings `c`: the code of `start`.
+    fn begin_with(self, c: Pca9685Config) -> Int [hw]
+        start(self.link, self.osc_hz, c)
+
+    // Sets the PWM frequency of all channels: the code of `set_frequency`.
+    fn set_frequency_hz(self, hz: Int) -> Int [hw]
+        set_frequency(self.link, self.osc_hz, hz)
+
+    // The PWM frequency in hertz now, 0 when the part does not answer.
+    fn frequency_hz(self) -> Int [hw]
+        frequency_read(self.link, self.osc_hz)
+
+    // An LED's duty in parts per thousand (`channel_duty`).
+    fn led_duty(self, ch: Int, permille: Int) -> Bool [hw]
+        channel_duty(self.link, ch, permille)
+
+    // A servo's pulse in microseconds (`servo_us`).
+    fn servo_pulse_us(self, ch: Int, us: Int) -> Bool [hw]
+        servo_us(self.link, self.osc_hz, ch, us)
+
+    // A pulse of `width` counts from count `on` (`channel_pulse`).
+    fn pulse(self, ch: Int, on: Int, width: Int) -> Bool [hw]
+        channel_pulse(self.link, ch, on, width)
+
+    // Every channel off.
+    fn all_off(self) -> Bool [hw]
+        channel_off(self.link, PCA9685_ALL)
+
+    // Sleep and wake (`sleep`, `wake`).
+    fn sleep(self) -> Bool [hw]
+        sleep(self.link)
+
+    fn wake(self, restart: Bool) -> Bool [hw]
+        wake(self.link, restart)
+
+    // Drives the OE pin.
+    fn outputs(self, on: Bool) -> Bool [hw]
+        output_enable(self.link, on)
+
+impl Pwm for Pca9685
+    // Sets the frequency of the whole part from the first channel started
+    // (`pwm_init`).  The trait answers nothing, so a refusal is not
+    // visible here; `pwm_init` and `set_frequency` answer it.
+    fn init(self, channel: Int, freq: Int) [hw]
+        let _ = pwm_init(self.link, self.osc_hz, channel, freq)
+
+    // The duty in parts per thousand (`channel_duty`).
+    fn set_duty(self, channel: Int, duty: Int) [hw]
+        let _ = channel_duty(self.link, channel, duty)
+
+    // Resumes a channel stopped by `disable` (`channel_enable`).
+    fn enable(self, channel: Int) [hw]
+        let _ = channel_enable(self.link, channel)
+
+    // Stops a channel and keeps its counts (`channel_disable`).
+    fn disable(self, channel: Int) [hw]
+        let _ = channel_disable(self.link, channel)

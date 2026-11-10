@@ -1,0 +1,1149 @@
+// pca9685_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus the way NXP's data sheet (PCA9685 Rev. 4,
+// 16 April 2015) says a PCA9685 does, so every transaction of every entry
+// point is checked on the host.
+//
+// The double follows the data sheet where the driver depends on it:
+//
+//   - auto-increment (MODE1.AI) is off at power-up, and without it the
+//     bytes of a transaction all go to one register; with it the pointer
+//     moves on, rolls over after register 69, and runs from 250 to 254;
+//   - a write to PRE_SCALE is ignored while SLEEP is clear;
+//   - setting SLEEP while a channel runs sets RESTART, and a write of 1 to
+//     RESTART clears it and counts one restart;
+//   - EXTCLK, once set, stays set;
+//   - the ALL_LED registers write all sixteen channels and read as zero;
+//   - the part answers its address, the all-call address when ALLCALL is
+//     set, and a sub-address when its SUBx bit is set;
+//   - the general call with byte 6 resets every register.
+//
+// The log records what the driver did, as integers:
+//   1 reg n          a read of n registers from reg
+//   2 reg n bytes    a write of n bytes from reg
+//   3 us             a wait
+//   4 byte           the general-call write
+//   5 pin level      a pin driven
+//   6 hz             the bus initialised at hz
+//   7 pin dir        a pin's mode
+//
+// The double can refuse the n-th write (`st` 2) or the n-th read (`st` 7),
+// a register's writes (`mute`) or reads (`deaf`), or ignore the prescale
+// regardless of SLEEP (`st` 4), to run the paths of a part that stops
+// answering.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut, Timer, Pwm }
+use dev_bus.{ DeviceWiring, DevBytes }
+use pca9685
+use pca9685.{ Pca9685, PcaLink, PcaChannel, Pca9685Config }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `st` keys: 1 is 1 when a part is there; 2 the write to refuse, counting
+// from 1, 0 for none; 3 the writes seen; 4 is 1 to ignore the prescale;
+// 5 the restarts counted; 7 the read to refuse; 8 the reads seen; 9 the
+// 7-bit address of the part.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.log, -1)
+    c.log.insert(n, v)
+    c.log.insert(-1, n + 1)
+
+fn log_clear(c: Chip)
+    c.log.clear()
+
+// The register file at its power-up values (Table 4 and the field
+// tables): MODE1 0x11, MODE2 0x04, the sub-addresses 0xE2, 0xE4 and 0xE8,
+// the all-call address 0xE0, every channel off (OFF_H 0x10), PRE_SCALE
+// 0x1E.
+fn power_up(c: Chip)
+    c.regs.clear()
+    c.regs.insert(0x00, 0x11)
+    c.regs.insert(0x01, 0x04)
+    c.regs.insert(0x02, 0xE2)
+    c.regs.insert(0x03, 0xE4)
+    c.regs.insert(0x04, 0xE8)
+    c.regs.insert(0x05, 0xE0)
+    c.regs.insert(0xFE, 0x1E)
+    for ch in 0..16
+        c.regs.insert(0x06 + 4 * ch + 3, 0x10)
+
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), mute: HashMap.new(), deaf: HashMap.new(), log: HashMap.new() }
+    c.st.insert(1, 1)
+    c.st.insert(9, 0x40)
+    power_up(c)
+    c
+
+// A chip that has been brought up: auto-increment on, awake.
+fn awake() -> Chip
+    let c = chip()
+    c.regs.insert(0x00, 0x20)
+    c
+
+// Whether any channel's output runs: its full-off bit is clear.
+fn running(c: Chip) -> Bool
+    var any = false
+    for ch in 0..16
+        if (at(c.regs, 0x06 + 4 * ch + 3) & 0x10) == 0
+            any = true
+    any
+
+// The register after `p` when the pointer increments (Table 4).
+fn next_reg(p: Int) -> Int
+    if p == 0x45 or p == 0xFE
+        return 0
+    p + 1
+
+// A register written with the part's rules.
+fn store(c: Chip, reg: Int, v: Int)
+    if reg == 0x00
+        let old = at(c.regs, 0)
+        var nv = v & 0x7F
+        if (v & 0x80) != 0
+            // A write of 1 to RESTART clears it; with the oscillator on it
+            // restarts the channels.
+            if (old & 0x10) == 0
+                c.st.insert(5, at(c.st, 5) + 1)
+        else
+            nv = nv | (old & 0x80)
+        if (old & 0x40) != 0
+            nv = nv | 0x40
+        if (v & 0x10) != 0 and (old & 0x10) == 0 and running(c)
+            nv = nv | 0x80
+        c.regs.insert(0, nv)
+        return
+    if reg == 0xFE
+        if (at(c.regs, 0) & 0x10) != 0 and at(c.st, 4) == 0
+            c.regs.insert(0xFE, v & 0xFF)
+        return
+    if reg >= 0xFA and reg <= 0xFD
+        for ch in 0..16
+            store(c, 0x06 + 4 * ch + (reg - 0xFA), v)
+        return
+    if reg >= 0x06 and reg <= 0x45
+        if (reg - 0x06) % 2 == 1
+            c.regs.insert(reg, v & 0x1F)
+            return
+        c.regs.insert(reg, v & 0xFF)
+        return
+    if reg >= 0x02 and reg <= 0x05
+        c.regs.insert(reg, v & 0xFE)
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+fn hear(c: Chip) -> Int
+    at(c.st, 9)
+
+// Whether the part acknowledges the 7-bit address `addr`: its own, the
+// all-call address with ALLCALL set, or a sub-address with its SUBx bit.
+fn responds(c: Chip, addr: Int) -> Bool
+    if at(c.st, 1) == 0
+        return false
+    if addr == hear(c)
+        return true
+    let m1 = at(c.regs, 0)
+    if (m1 & 0x01) != 0 and addr == at(c.regs, 5) >> 1
+        return true
+    for n in 0..3
+        if (m1 & (0x08 >> n)) != 0 and addr == at(c.regs, 2 + n) >> 1
+            return true
+    false
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        log_push(self.c, 6)
+        log_push(self.c, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr == 0
+            log_push(self.c, 4)
+            log_push(self.c, data[0] as Int)
+            if at(self.c.st, 1) == 0
+                return false
+            if data[0] == 6 and data.len() == 1
+                power_up(self.c)
+                return true
+            return false
+        log_push(self.c, 2)
+        log_push(self.c, data[0] as Int)
+        log_push(self.c, data.len() - 1)
+        for i in 1..data.len()
+            log_push(self.c, data[i] as Int)
+        if not responds(self.c, addr) or data.len() < 2
+            return false
+        self.c.st.insert(3, at(self.c.st, 3) + 1)
+        if at(self.c.st, 2) == at(self.c.st, 3)
+            return false
+        var p = data[0] as Int
+        if at(self.c.mute, p) != 0
+            return false
+        let ai = (at(self.c.regs, 0) & 0x20) != 0
+        for i in 1..data.len()
+            store(self.c, p, data[i] as Int)
+            if ai
+                p = next_reg(p)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 1)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        if not responds(self.c, addr)
+            return None
+        self.c.st.insert(8, at(self.c.st, 8) + 1)
+        if at(self.c.st, 7) == at(self.c.st, 8)
+            return None
+        var p = tx[0] as Int
+        if at(self.c.deaf, p) != 0
+            return None
+        let ai = (at(self.c.regs, 0) & 0x20) != 0
+        var out: [u8] = []
+        for _i in 0..n
+            if p >= 0xFA and p <= 0xFD
+                list.push(out, 0 as u8)
+            else
+                list.push(out, at(self.c.regs, p) as u8)
+            if ai
+                p = next_reg(p)
+        Some(out)
+
+struct FakePins
+    c: Chip
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        log_push(self.c, 7)
+        log_push(self.c, pin)
+        log_push(self.c, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        log_push(self.c, 5)
+        log_push(self.c, pin)
+        log_push(self.c, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        0
+
+struct FakeTimer
+    c: Chip
+
+impl Timer for FakeTimer
+    fn delay_ms(self, ms: Int) [hw]
+        log_push(self.c, 3)
+        log_push(self.c, ms * 1000)
+
+    fn delay_us(self, us: Int) [hw]
+        log_push(self.c, 3)
+        log_push(self.c, us)
+
+// The link over the double: the driver's own framing functions over the
+// double's bus, pins and timer.
+struct TestLink
+    c: Chip
+    w: DeviceWiring
+
+impl PcaLink for TestLink
+    fn link_read(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        pca9685.i2c_read(FakeI2c { c: self.c }, self.w, reg, n, var dst)
+
+    fn link_write(self, reg: Int, src: DevBytes) -> Bool [hw]
+        pca9685.i2c_write(FakeI2c { c: self.c }, self.w, reg, src)
+
+    fn link_call(self, byte: Int) -> Bool [hw]
+        pca9685.i2c_call(FakeI2c { c: self.c }, byte)
+
+    fn link_wait(self, us: Int) [hw]
+        FakeTimer { c: self.c }.delay_us(us)
+
+    fn link_output(self, enable: Bool) -> Bool [hw]
+        pca9685.oe_drive(FakePins { c: self.c }, self.w, enable)
+
+    fn link_setup(self) [hw]
+        pca9685.link_ready(FakeI2c { c: self.c }, FakePins { c: self.c }, self.w)
+
+fn link(c: Chip) -> TestLink
+    TestLink { c: c, w: dev_bus.wiring_i2c(0, 0x40) }
+
+// The same with an OE pin, 22.
+fn link_oe(c: Chip) -> TestLink
+    TestLink { c: c, w: dev_bus.wiring_en(dev_bus.wiring_i2c(0, 0x40), 22) }
+
+// Whether the log holds exactly the integers of `xs`.
+fn log_is(c: Chip, xs: [Int]) -> Bool
+    if at(c.log, -1) != xs.len()
+        return false
+    for i in 0..xs.len()
+        if at(c.log, i) != xs[i]
+            return false
+    true
+
+fn reg(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// The word a channel's registers hold: the ON word then the OFF word.
+fn on_of(c: Chip, ch: Int) -> Int
+    at(c.regs, 6 + 4 * ch) | (at(c.regs, 7 + 4 * ch) << 8)
+
+fn off_of(c: Chip, ch: Int) -> Int
+    at(c.regs, 8 + 4 * ch) | (at(c.regs, 9 + 4 * ch) << 8)
+
+// ── The computations ─────────────────────────────────────────────────
+
+@test
+fn test_prescale_follows_the_data_sheets_formula() [io]
+    // § 7.3.5: the example, 200 Hz at 25 MHz, is 30 (0x1E).
+    test.assert_eq(pca9685.prescale_for(25000000, 200), 30)
+    // The servo rates: 50 Hz is 121, the value Adafruit's library writes;
+    // 60 Hz rounds 101.7 to 102 and gives 101.
+    test.assert_eq(pca9685.prescale_for(25000000, 50), 121)
+    test.assert_eq(pca9685.prescale_for(25000000, 60), 101)
+    test.assert_eq(pca9685.prescale_for(25000000, 100), 60)
+    test.assert_eq(pca9685.prescale_for(25000000, 1000), 5)
+    // The ends: 1526 Hz is 3 and 24 Hz is 253 (the 0xFF register is 24 Hz
+    // exactly: 25 MHz over 4096 x 256 is 23.8 Hz).
+    test.assert_eq(pca9685.prescale_for(25000000, 1526), 3)
+    test.assert_eq(pca9685.prescale_for(25000000, 24), 253)
+    test.assert_eq(pca9685.prescale_for(25000000, 1600), 3)
+    // Past either end the part cannot make the rate.
+    test.assert_eq(pca9685.prescale_for(25000000, 2000), -1)
+    test.assert_eq(pca9685.prescale_for(25000000, 23), -1)
+    test.assert_eq(pca9685.prescale_for(25000000, 0), -1)
+    test.assert_eq(pca9685.prescale_for(25000000, -5), -1)
+    test.assert_eq(pca9685.prescale_for(0, 50), -1)
+    // An external clock: 50 MHz at 1 kHz is 12.2, so 11; 8 MHz at 50 Hz
+    // is 39.06, so 38.
+    test.assert_eq(pca9685.prescale_for(50000000, 1000), 11)
+    test.assert_eq(pca9685.prescale_for(8000000, 50), 38)
+    // Rounding is to the nearest with halves up: 25 MHz / (4096 x 40) is
+    // 152.59, which rounds to 153 and gives 152.
+    test.assert_eq(pca9685.prescale_for(25000000, 40), 152)
+
+@test
+fn test_the_prescale_gives_back_its_frequency() [io]
+    test.assert_eq(pca9685.frequency_of(25000000, 30), 197)
+    test.assert_eq(pca9685.frequency_of(25000000, 121), 50)
+    test.assert_eq(pca9685.frequency_of(25000000, 255), 24)
+    test.assert_eq(pca9685.frequency_of(25000000, 3), 1526)
+    // The period of 50 Hz, in microseconds: 20 ms.
+    test.assert_eq(pca9685.period_us_of(25000000, 121), 19988)
+    test.assert_eq(pca9685.period_us_of(0, 121), 0)
+    // The prescale of a frequency, back to a frequency within one step.
+    // The prescale gives the whole number of 4096-count periods of the
+    // oscillator nearest the wanted period.
+    for hz in 24..1527
+        let p = pca9685.prescale_for(25000000, hz)
+        test.assert(p >= 3)
+        let diff = 2 * 25000000 - 2 * (p + 1) * 4096 * hz
+        test.assert(diff <= 4096 * hz and diff >= 0 - 4096 * hz)
+
+@test
+fn test_duty_is_rounded_to_the_nearest_of_4096_counts() [io]
+    test.assert_eq(pca9685.duty_counts(0), 0)
+    test.assert_eq(pca9685.duty_counts(1), 4)
+    test.assert_eq(pca9685.duty_counts(250), 1024)
+    test.assert_eq(pca9685.duty_counts(500), 2048)
+    test.assert_eq(pca9685.duty_counts(999), 4092)
+    test.assert_eq(pca9685.duty_counts(1000), 4096)
+    test.assert_eq(pca9685.duty_counts(-5), 0)
+    test.assert_eq(pca9685.duty_counts(2000), 4096)
+
+@test
+fn test_a_pulse_is_counted_at_the_prescale_the_part_holds() [io]
+    // 1500 us at 50 Hz (prescale 121): 307 counts of 4.88 us.
+    test.assert_eq(pca9685.pulse_counts(1500, 25000000, 121), 307)
+    test.assert_eq(pca9685.pulse_counts(1000, 25000000, 121), 205)
+    test.assert_eq(pca9685.pulse_counts(2000, 25000000, 121), 410)
+    test.assert_eq(pca9685.pulse_counts(500, 25000000, 121), 102)
+    // At 60 Hz (prescale 101) a count is 4.08 us.
+    test.assert_eq(pca9685.pulse_counts(1500, 25000000, 101), 368)
+    // The pulse of the whole period is 4096 counts or more.
+    test.assert(pca9685.pulse_counts(20000, 25000000, 121) >= 4096)
+    test.assert_eq(pca9685.pulse_counts(0, 25000000, 121), 0)
+    test.assert_eq(pca9685.pulse_counts(-3, 25000000, 121), 0)
+    test.assert_eq(pca9685.pulse_counts(1500, 0, 121), 0)
+
+@test
+fn test_a_servo_angle_is_a_pulse_between_the_ends() [io]
+    test.assert_eq(pca9685.servo_us_of(90, 180, 1000, 2000), 1500)
+    test.assert_eq(pca9685.servo_us_of(0, 180, 1000, 2000), 1000)
+    test.assert_eq(pca9685.servo_us_of(180, 180, 1000, 2000), 2000)
+    test.assert_eq(pca9685.servo_us_of(45, 180, 500, 2500), 1000)
+    // Held to the travel.
+    test.assert_eq(pca9685.servo_us_of(-10, 180, 1000, 2000), 1000)
+    test.assert_eq(pca9685.servo_us_of(270, 180, 1000, 2000), 2000)
+    test.assert_eq(pca9685.servo_us_of(10, 0, 1000, 2000), 1000)
+
+@test
+fn test_the_default_settings_are_the_parts_own() [io]
+    let c = pca9685.config_default()
+    test.assert_eq(c.freq_hz, 200)
+    test.assert(c.totem_pole)
+    test.assert(not c.allcall)
+    test.assert(not c.keep_outputs)
+    test.assert_eq(c.subs, 0)
+    let f = pca9685.config_at(50)
+    test.assert_eq(f.freq_hz, 50)
+    test.assert(f.totem_pole)
+    test.assert(not f.invert)
+    test.assert(not f.och_on_ack)
+    test.assert(not f.ext_clk)
+    test.assert_eq(f.outne, 0)
+
+// ── Registers and channels ───────────────────────────────────────────
+
+@test
+fn test_a_register_is_read_and_written_in_one_transaction() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.reg_write(l, 0x01, 0x0C))
+    test.assert_eq(pca9685.reg_read(l, 0x01) ?? -1, 0x0C)
+    test.assert(log_is(c, [2, 1, 1, 0x0C, 1, 1, 1]))
+    test.assert_eq(pca9685.mode2_read(l) ?? -1, 0x0C)
+    test.assert_eq(pca9685.mode1_read(l) ?? -1, 0x20)
+    test.assert_eq(pca9685.prescale_read(l) ?? -1, 0x1E)
+
+@test
+fn test_a_channel_is_four_bytes_in_one_transaction() [io]
+    let c = awake()
+    let l = link(c)
+    // Channel 3 starts at count 0x123 and stops at 0x456.
+    test.assert(pca9685.channel_set(l, 3, 0x123, 0x456))
+    test.assert(log_is(c, [2, 0x12, 4, 0x23, 0x01, 0x56, 0x04]))
+    test.assert_eq(on_of(c, 3), 0x123)
+    test.assert_eq(off_of(c, 3), 0x456)
+    // The neighbours are not touched.
+    test.assert_eq(off_of(c, 2), 0x1000)
+    test.assert_eq(off_of(c, 4), 0x1000)
+    // The full bits travel in the high byte, bit 4.
+    test.assert(pca9685.channel_set(l, 15, 0x1000, 0))
+    test.assert_eq(on_of(c, 15), 0x1000)
+    test.assert_eq(reg(c, 0x43), 0x10)
+    // The bits above the full bit are not written by the part.
+    test.assert(pca9685.channel_set(l, 15, 0xFFFF, 0xFFFF))
+    test.assert_eq(on_of(c, 15), 0x1FFF)
+    // A channel past the last, and below the first, is refused with no
+    // transaction.
+    log_clear(c)
+    test.assert(not pca9685.channel_set(l, 17, 0, 0))
+    test.assert(not pca9685.channel_set(l, -1, 0, 0))
+    test.assert(log_is(c, []))
+
+@test
+fn test_a_channel_reads_back_as_written() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_set(l, 9, 0x0ABC, 0x1000))
+    log_clear(c)
+    let ch = pca9685.channel_read(l, 9) ?? PcaChannel { on: -1, off: -1 }
+    test.assert_eq(ch.on, 0x0ABC)
+    test.assert_eq(ch.off, 0x1000)
+    test.assert(log_is(c, [1, 0x2A, 4]))
+    test.assert(pca9685.channel_is_full_off(ch))
+    test.assert(not pca9685.channel_is_full_on(ch))
+    // ALL_LED reads as zero, so it is not read; a channel past 15 is None.
+    log_clear(c)
+    test.assert(pca9685.channel_read(l, 16) == None)
+    test.assert(pca9685.channel_read(l, -1) == None)
+    test.assert(log_is(c, []))
+    // A part that does not answer.
+    c.deaf.insert(0x2A, 1)
+    test.assert(pca9685.channel_read(l, 9) == None)
+
+@test
+fn test_the_full_bits_are_read_as_states() [io]
+    let on = PcaChannel { on: 0x1000, off: 0x0000 }
+    test.assert(pca9685.channel_is_full_on(on))
+    test.assert(not pca9685.channel_is_full_off(on))
+    // Full-off wins when both are set (§ 7.3.3).
+    let both = PcaChannel { on: 0x1000, off: 0x1000 }
+    test.assert(pca9685.channel_is_full_off(both))
+    test.assert(not pca9685.channel_is_full_on(both))
+    let pulse = PcaChannel { on: 0x0010, off: 0x0200 }
+    test.assert(not pca9685.channel_is_full_on(pulse))
+    test.assert(not pca9685.channel_is_full_off(pulse))
+
+@test
+fn test_a_pulse_has_its_off_count_wrapped_to_twelve_bits() [io]
+    let c = awake()
+    let l = link(c)
+    // The data sheet's example 1 (§ 7.3.3): a delay of 410 - 1 counts and
+    // 819 counts of width: ON 409, OFF 1228.
+    test.assert(pca9685.channel_pulse(l, 0, 409, 819))
+    test.assert_eq(on_of(c, 0), 409)
+    test.assert_eq(off_of(c, 0), 1228)
+    // Example 2: ON 3685 and 3686 counts of width wrap to OFF 3275.
+    test.assert(pca9685.channel_pulse(l, 4, 3685, 3686))
+    test.assert_eq(on_of(c, 4), 3685)
+    test.assert_eq(off_of(c, 4), 3275)
+    // A width of the whole period less one ends one count before it starts.
+    test.assert(pca9685.channel_pulse(l, 5, 100, 4095))
+    test.assert_eq(off_of(c, 5), 99)
+    // ON and OFF are never equal: width 0 is the full-off bit, with the
+    // ON word cleared, and a width of 4096 or more is the full-on bit.
+    test.assert(pca9685.channel_pulse(l, 6, 50, 0))
+    test.assert_eq(on_of(c, 6), 0)
+    test.assert_eq(off_of(c, 6), 0x1000)
+    test.assert(pca9685.channel_pulse(l, 6, 50, -4))
+    test.assert_eq(off_of(c, 6), 0x1000)
+    test.assert(pca9685.channel_pulse(l, 7, 50, 4096))
+    test.assert_eq(on_of(c, 7), 0x1000 | 50)
+    test.assert_eq(off_of(c, 7), 0)
+    test.assert(pca9685.channel_pulse(l, 7, 0, 9000))
+    test.assert_eq(on_of(c, 7), 0x1000)
+    // ON is held to 12 bits.
+    test.assert(pca9685.channel_pulse(l, 8, 0x1005, 10))
+    test.assert_eq(on_of(c, 8), 5)
+    test.assert_eq(off_of(c, 8), 15)
+
+@test
+fn test_a_duty_starts_at_count_zero() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 1, 250))
+    test.assert_eq(on_of(c, 1), 0)
+    test.assert_eq(off_of(c, 1), 1024)
+    test.assert(pca9685.channel_duty(l, 1, 1000))
+    test.assert_eq(on_of(c, 1), 0x1000)
+    test.assert_eq(off_of(c, 1), 0)
+    test.assert(pca9685.channel_duty(l, 1, 0))
+    test.assert_eq(off_of(c, 1), 0x1000)
+    test.assert(log_is(c, [2, 0x0A, 4, 0, 0, 0, 4, 2, 0x0A, 4, 0, 0x10, 0, 0, 2, 0x0A, 4, 0, 0, 0, 0x10]))
+
+@test
+fn test_all_channels_are_written_through_the_all_led_registers() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 16, 500))
+    test.assert(log_is(c, [2, 0xFA, 4, 0, 0, 0, 8]))
+    for ch in 0..16
+        test.assert_eq(off_of(c, ch), 2048)
+    test.assert(pca9685.channel_off(l, pca9685.PCA9685_ALL))
+    for ch in 0..16
+        test.assert_eq(off_of(c, ch), 0x1000)
+
+@test
+fn test_a_channel_without_auto_increment_is_not_written_whole() [io]
+    // The reason `start` turns AI on: with it off the four bytes land in
+    // one register, and the double shows the channel unchanged.
+    let c = chip()
+    let l = link(c)
+    test.assert(pca9685.channel_set(l, 0, 0x111, 0x222))
+    test.assert(on_of(c, 0) != 0x111)
+    test.assert_eq(off_of(c, 0), 0x1000)
+
+@test
+fn test_a_disabled_channel_keeps_its_counts() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 2, 250))
+    log_clear(c)
+    test.assert(pca9685.channel_disable(l, 2))
+    // The four registers are read and written together, so MODE2.OCH does
+    // not hold the change back.
+    test.assert(log_is(c, [1, 0x0E, 4, 2, 0x0E, 4, 0, 0, 0, 0x14]))
+    test.assert_eq(off_of(c, 2), 0x1400)
+    test.assert(pca9685.channel_is_full_off(pca9685.channel_read(l, 2) ?? PcaChannel { on: 0, off: 0 }))
+    log_clear(c)
+    test.assert(pca9685.channel_enable(l, 2))
+    test.assert(log_is(c, [1, 0x0E, 4, 2, 0x0E, 4, 0, 0, 0, 0x04]))
+    test.assert_eq(off_of(c, 2), 1024)
+    // A full-on channel resumes full-on.
+    test.assert(pca9685.channel_duty(l, 3, 1000))
+    test.assert(pca9685.channel_disable(l, 3))
+    test.assert(pca9685.channel_enable(l, 3))
+    test.assert_eq(on_of(c, 3), 0x1000)
+    test.assert_eq(off_of(c, 3), 0)
+
+@test
+fn test_enabling_a_channel_at_zero_duty_leaves_it_off() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_off(l, 4))
+    test.assert(pca9685.channel_enable(l, 4))
+    test.assert_eq(off_of(c, 4), 0x1000)
+    test.assert_eq(on_of(c, 4), 0)
+    test.assert(not running(c))
+
+@test
+fn test_disable_and_enable_need_the_part_to_answer() [io]
+    let c = awake()
+    let l = link(c)
+    c.deaf.insert(0x0E, 1)
+    test.assert(not pca9685.channel_disable(l, 2))
+    test.assert(not pca9685.channel_enable(l, 2))
+    test.assert(not pca9685.channel_disable(l, 16))
+    test.assert(not pca9685.channel_enable(l, 16))
+
+@test
+fn test_a_refused_channel_write_is_reported() [io]
+    let c = awake()
+    let l = link(c)
+    c.mute.insert(0x0E, 1)
+    test.assert(not pca9685.channel_duty(l, 2, 100))
+    test.assert(not pca9685.channel_off(l, 2))
+
+// ── Servo ────────────────────────────────────────────────────────────
+
+@test
+fn test_a_servo_pulse_reads_the_prescale_and_writes_the_counts() [io]
+    let c = awake()
+    c.regs.insert(0xFE, 121)
+    let l = link(c)
+    test.assert(pca9685.servo_us(l, 25000000, 0, 1500))
+    test.assert(log_is(c, [1, 0xFE, 1, 2, 0x06, 4, 0, 0, 0x33, 0x01]))
+    test.assert_eq(on_of(c, 0), 0)
+    test.assert_eq(off_of(c, 0), 307)
+    // A pulse as long as the period is not a servo pulse.
+    log_clear(c)
+    test.assert(not pca9685.servo_us(l, 25000000, 0, 20000))
+    test.assert(log_is(c, [1, 0xFE, 1]))
+    // A part that does not answer.
+    c.deaf.insert(0xFE, 1)
+    test.assert(not pca9685.servo_us(l, 25000000, 0, 1500))
+    // A pulse of zero turns the channel off.
+    c.deaf.clear()
+    test.assert(pca9685.servo_us(l, 25000000, 0, 0))
+    test.assert_eq(off_of(c, 0), 0x1000)
+
+@test
+fn test_servos_can_be_staggered_to_spread_the_current() [io]
+    let c = awake()
+    let l = link(c)
+    for ch in 0..4
+        test.assert(pca9685.channel_pulse(l, ch, ch * 256, 307))
+    test.assert_eq(on_of(c, 3), 768)
+    test.assert_eq(off_of(c, 3), 1075)
+
+// ── Start ────────────────────────────────────────────────────────────
+
+@test
+fn test_start_runs_the_data_sheets_sequence() [io]
+    let c = chip()
+    let l = link(c)
+    test.assert_eq(pca9685.start(l, 25000000, pca9685.config_default()), 0)
+    // AI and SLEEP; read for RESTART; MODE2; the prescale and its readback;
+    // every output off; SLEEP clear; the oscillator's 500 us.
+    test.assert(log_is(c, [
+        6, 400000,
+        1, 0, 1,
+        2, 0x00, 1, 0x30,
+        1, 0, 1,
+        2, 0x01, 1, 0x04,
+        2, 0xFE, 1, 30,
+        1, 0xFE, 1,
+        2, 0xFA, 4, 0, 0, 0, 0x10,
+        2, 0x00, 1, 0x20,
+        3, 500]))
+    test.assert_eq(reg(c, 0), 0x20)
+    test.assert_eq(reg(c, 1), 0x04)
+    test.assert_eq(reg(c, 0xFE), 30)
+    for ch in 0..16
+        test.assert_eq(off_of(c, ch), 0x1000)
+    test.assert_eq(at(c.st, 5), 0)
+
+@test
+fn test_start_drives_the_oe_pin_low_only_when_configured() [io]
+    let c = chip()
+    let l = link_oe(c)
+    test.assert_eq(pca9685.start(l, 25000000, pca9685.config_default()), 0)
+    // The pin is set high before it becomes an output, so it never drives
+    // low, and goes low at the end.
+    test.assert(log_is(c, [
+        6, 400000,
+        5, 22, 1,
+        7, 22, 1,
+        1, 0, 1,
+        2, 0x00, 1, 0x30,
+        1, 0, 1,
+        2, 0x01, 1, 0x04,
+        2, 0xFE, 1, 30,
+        1, 0xFE, 1,
+        2, 0xFA, 4, 0, 0, 0, 0x10,
+        2, 0x00, 1, 0x20,
+        3, 500,
+        5, 22, 0]))
+
+@test
+fn test_start_writes_the_settings_it_is_given() [io]
+    let c = chip()
+    let l = link(c)
+    let s = Pca9685Config { freq_hz: 50, ext_clk: false, totem_pole: false, invert: true,
+                            och_on_ack: true, outne: 2, allcall: true, subs: 5,
+                            keep_outputs: false }
+    test.assert_eq(pca9685.start(l, 25000000, s), 0)
+    // MODE2: INVRT, OCH, open drain, OUTNE 2.
+    test.assert_eq(reg(c, 1), 0x1A)
+    // MODE1: AI, SUB1 and SUB3, ALLCALL; SLEEP clear.
+    test.assert_eq(reg(c, 0), 0x20 | 0x08 | 0x02 | 0x01)
+    test.assert_eq(reg(c, 0xFE), 121)
+
+@test
+fn test_start_switches_to_the_external_clock_while_asleep() [io]
+    let c = chip()
+    let l = link(c)
+    let s = Pca9685Config { freq_hz: 1000, ext_clk: true, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: false }
+    test.assert_eq(pca9685.start(l, 50000000, s), 0)
+    // SLEEP, then SLEEP and EXTCLK (Table 5), the prescale of 50 MHz at
+    // 1 kHz, SLEEP clear with EXTCLK kept, and no wait: the external
+    // clock needs no start-up delay.
+    test.assert(log_is(c, [
+        6, 400000,
+        1, 0, 1,
+        2, 0x00, 1, 0x30,
+        1, 0, 1,
+        2, 0x00, 1, 0x70,
+        2, 0x01, 1, 0x04,
+        2, 0xFE, 1, 11,
+        1, 0xFE, 1,
+        2, 0xFA, 4, 0, 0, 0, 0x10,
+        2, 0x00, 1, 0x60]))
+    test.assert_eq(reg(c, 0), 0x60)
+
+@test
+fn test_start_keeping_the_outputs_restarts_the_channels_that_ran() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 0, 500))
+    test.assert(pca9685.channel_duty(l, 7, 100))
+    log_clear(c)
+    let cfg = Pca9685Config { freq_hz: 200, ext_clk: false, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: true }
+    test.assert_eq(pca9685.start(l, 25000000, cfg), 0)
+    // The sleep write made the part set RESTART; start read it and wrote 1
+    // to it once the oscillator was back.
+    test.assert(log_is(c, [
+        6, 400000,
+        1, 0, 1,
+        2, 0x00, 1, 0x30,
+        1, 0, 1,
+        2, 0x01, 1, 0x04,
+        2, 0xFE, 1, 30,
+        1, 0xFE, 1,
+        2, 0x00, 1, 0x20,
+        3, 500,
+        2, 0x00, 1, 0xA0]))
+    test.assert_eq(at(c.st, 5), 1)
+    test.assert_eq(reg(c, 0) & 0x80, 0)
+    test.assert_eq(off_of(c, 0), 2048)
+    test.assert_eq(off_of(c, 7), 410)
+
+@test
+fn test_start_keeping_idle_outputs_does_not_restart() [io]
+    let c = chip()
+    let l = link(c)
+    let s = Pca9685Config { freq_hz: 200, ext_clk: false, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: true }
+    test.assert_eq(pca9685.start(l, 25000000, s), 0)
+    test.assert_eq(at(c.st, 5), 0)
+
+@test
+fn test_start_refuses_a_frequency_the_part_cannot_make() [io]
+    let c = chip()
+    let l = link(c)
+    let s = Pca9685Config { freq_hz: 2000, ext_clk: false, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: false }
+    test.assert_eq(pca9685.start(l, 25000000, s), -3)
+    // Nothing was sent.
+    test.assert(log_is(c, []))
+
+@test
+fn test_start_finds_no_part_when_nothing_answers() [io]
+    let c = chip()
+    c.st.insert(1, 0)
+    test.assert_eq(pca9685.start(link(c), 25000000, pca9685.config_default()), -1)
+    // A part that is there and does not answer MODE1.
+    let d = chip()
+    d.deaf.insert(0, 1)
+    test.assert_eq(pca9685.start(link(d), 25000000, pca9685.config_default()), -1)
+
+@test
+fn test_start_reports_each_refused_write() [io]
+    // The default settings write MODE1, MODE2, PRE_SCALE, ALL_LED and
+    // MODE1 again: five writes, and a refusal of any is -2.
+    for n in 1..6
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert_eq(pca9685.start(link(c), 25000000, pca9685.config_default()), -2)
+    let ok = chip()
+    ok.st.insert(2, 6)
+    test.assert_eq(pca9685.start(link(ok), 25000000, pca9685.config_default()), 0)
+
+@test
+fn test_start_reports_a_refused_external_clock_switch() [io]
+    let s = Pca9685Config { freq_hz: 1000, ext_clk: true, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: false }
+    // MODE1, MODE1 with EXTCLK, MODE2, PRE_SCALE, ALL_LED, MODE1.
+    for n in 1..7
+        let c = chip()
+        c.st.insert(2, n)
+        test.assert_eq(pca9685.start(link(c), 50000000, s), -2)
+
+@test
+fn test_start_reports_a_refused_restart() [io]
+    let s = Pca9685Config { freq_hz: 200, ext_clk: false, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: true }
+    // The channel runs, so the restart is written last, as the sixth write.
+    let c = awake()
+    test.assert(pca9685.channel_duty(link(c), 0, 500))
+    c.st.insert(3, 0)
+    c.st.insert(2, 5)
+    test.assert_eq(pca9685.start(link(c), 25000000, s), -2)
+
+@test
+fn test_start_notices_a_prescale_the_part_ignored() [io]
+    // 200 Hz is the prescale the part powers up with, so the check needs a
+    // different one to show that the write did not stick.
+    let c = chip()
+    c.st.insert(4, 1)
+    let s = Pca9685Config { freq_hz: 50, ext_clk: false, totem_pole: true, invert: false,
+                            och_on_ack: false, outne: 0, allcall: false, subs: 0,
+                            keep_outputs: false }
+    test.assert_eq(pca9685.start(link(c), 25000000, s), -2)
+
+@test
+fn test_start_survives_a_second_read_that_fails() [io]
+    // The read of MODE1 for RESTART fails: it reads as no restart.
+    let c = chip()
+    c.st.insert(7, 2)
+    test.assert_eq(pca9685.start(link(c), 25000000, pca9685.config_default()), 0)
+
+// ── Frequency ────────────────────────────────────────────────────────
+
+@test
+fn test_a_new_frequency_needs_sleep_and_a_wait() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert_eq(pca9685.set_frequency(l, 25000000, 50), 0)
+    test.assert(log_is(c, [
+        1, 0, 1,
+        2, 0x00, 1, 0x30,
+        1, 0, 1,
+        2, 0xFE, 1, 121,
+        1, 0xFE, 1,
+        2, 0x00, 1, 0x20,
+        3, 500]))
+    test.assert_eq(reg(c, 0xFE), 121)
+    test.assert_eq(reg(c, 0), 0x20)
+
+@test
+fn test_a_running_channel_is_restarted_after_a_frequency_change() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 1, 300))
+    log_clear(c)
+    test.assert_eq(pca9685.set_frequency(l, 25000000, 60), 0)
+    test.assert(log_is(c, [
+        1, 0, 1,
+        2, 0x00, 1, 0x30,
+        1, 0, 1,
+        2, 0xFE, 1, 101,
+        1, 0xFE, 1,
+        2, 0x00, 1, 0x20,
+        3, 500,
+        2, 0x00, 1, 0xA0]))
+    test.assert_eq(at(c.st, 5), 1)
+    test.assert_eq(off_of(c, 1), 1229)
+
+@test
+fn test_a_frequency_change_keeps_the_other_bits_of_mode1() [io]
+    // EXTCLK, the sub-address bits and AI are kept; RESTART is masked out of
+    // every write so a read of 1 does not restart the part.
+    let c = awake()
+    c.regs.insert(0, 0xE9)
+    let l = link(c)
+    test.assert_eq(pca9685.set_frequency(l, 50000000, 1000), 0)
+    // The sleep write is 0x79: RESTART (bit 7) read as 1 is not written
+    // back, EXTCLK, SUB1, ALLCALL and AI are, with SLEEP set.
+    test.assert_eq(at(c.log, 6), 0x79)
+    // The part had a restart pending, so it is written once at the end,
+    // after the oscillator's wait, and clears the bit.
+    test.assert_eq(at(c.st, 5), 1)
+    test.assert_eq(reg(c, 0), 0x69)
+
+@test
+fn test_a_sleeping_part_keeps_sleeping_through_a_frequency_change() [io]
+    let c = chip()
+    c.regs.insert(0, 0x30)
+    let l = link(c)
+    test.assert_eq(pca9685.set_frequency(l, 25000000, 50), 0)
+    // The part was asleep: no sleep write, no wake and no wait.
+    test.assert(log_is(c, [
+        1, 0, 1,
+        1, 0, 1,
+        2, 0xFE, 1, 121,
+        1, 0xFE, 1]))
+    test.assert_eq(reg(c, 0), 0x30)
+
+@test
+fn test_set_frequency_reports_what_went_wrong() [io]
+    let c = awake()
+    test.assert_eq(pca9685.set_frequency(link(c), 25000000, 5000), -3)
+    c.st.insert(1, 0)
+    test.assert_eq(pca9685.set_frequency(link(c), 25000000, 50), -1)
+    // Writes: MODE1 sleep, PRE_SCALE, MODE1 awake, then the restart.
+    for n in 1..4
+        let d = awake()
+        d.st.insert(2, n)
+        test.assert_eq(pca9685.set_frequency(link(d), 25000000, 50), -2)
+    // A restart that is refused.
+    let r = awake()
+    test.assert(pca9685.channel_duty(link(r), 0, 500))
+    r.st.insert(3, 0)
+    r.st.insert(2, 4)
+    test.assert_eq(pca9685.set_frequency(link(r), 25000000, 50), -2)
+    // A prescale the part ignores.
+    let i = awake()
+    i.st.insert(4, 1)
+    test.assert_eq(pca9685.set_frequency(link(i), 25000000, 50), -2)
+    // The second read of MODE1 failing reads as no restart.
+    let s = awake()
+    s.st.insert(7, 2)
+    test.assert_eq(pca9685.set_frequency(link(s), 25000000, 50), 0)
+
+@test
+fn test_the_running_frequency_is_read_from_the_prescale() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert_eq(pca9685.frequency_read(l, 25000000), 197)
+    test.assert_eq(pca9685.set_frequency(l, 25000000, 50), 0)
+    test.assert_eq(pca9685.frequency_read(l, 25000000), 50)
+    c.deaf.insert(0xFE, 1)
+    test.assert_eq(pca9685.frequency_read(l, 25000000), 0)
+
+@test
+fn test_pwm_init_sets_the_frequency_once() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.pwm_init(l, 25000000, 0, 50))
+    test.assert_eq(reg(c, 0xFE), 121)
+    // The same frequency again reads the prescale and writes nothing.
+    log_clear(c)
+    test.assert(pca9685.pwm_init(l, 25000000, 5, 50))
+    test.assert(log_is(c, [1, 0xFE, 1]))
+    // A channel outside 0 to 15, a frequency out of range, a part that
+    // does not answer.
+    log_clear(c)
+    test.assert(not pca9685.pwm_init(l, 25000000, 16, 50))
+    test.assert(not pca9685.pwm_init(l, 25000000, -1, 50))
+    test.assert(not pca9685.pwm_init(l, 25000000, 0, 4000))
+    test.assert(log_is(c, []))
+    c.deaf.insert(0xFE, 1)
+    test.assert(not pca9685.pwm_init(l, 25000000, 0, 100))
+
+@test
+fn test_pwm_init_reports_a_refused_change() [io]
+    let c = awake()
+    c.st.insert(2, 2)
+    test.assert(not pca9685.pwm_init(link(c), 25000000, 0, 50))
+
+// ── Sleep, wake, reset, addresses ────────────────────────────────────
+
+@test
+fn test_sleep_and_wake_keep_the_other_bits() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.sleep(l))
+    test.assert_eq(reg(c, 0), 0x30)
+    log_clear(c)
+    test.assert(pca9685.wake(l, false))
+    test.assert(log_is(c, [1, 0, 1, 2, 0, 1, 0x20, 3, 500]))
+    test.assert_eq(reg(c, 0), 0x20)
+    c.deaf.insert(0, 1)
+    test.assert(not pca9685.sleep(l))
+    test.assert(not pca9685.wake(l, false))
+
+@test
+fn test_waking_with_a_restart_resumes_the_channels() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 2, 500))
+    test.assert(pca9685.sleep(l))
+    test.assert_eq(reg(c, 0) & 0x80, 0x80)
+    log_clear(c)
+    test.assert(pca9685.wake(l, true))
+    test.assert(log_is(c, [1, 0, 1, 2, 0, 1, 0x20, 3, 500, 2, 0, 1, 0xA0]))
+    test.assert_eq(at(c.st, 5), 1)
+    test.assert_eq(reg(c, 0) & 0x80, 0)
+    // A wake without a restart pending writes nothing more.
+    test.assert(pca9685.channel_off(l, pca9685.PCA9685_ALL))
+    test.assert(pca9685.sleep(l))
+    test.assert_eq(reg(c, 0) & 0x80, 0)
+    log_clear(c)
+    test.assert(pca9685.wake(l, true))
+    test.assert(log_is(c, [1, 0, 1, 2, 0, 1, 0x20, 3, 500]))
+
+@test
+fn test_waking_reports_a_refused_write() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.sleep(l))
+    c.st.insert(3, 0)
+    c.st.insert(2, 1)
+    test.assert(not pca9685.wake(l, false))
+    let r = awake()
+    test.assert(pca9685.channel_duty(link(r), 2, 500))
+    test.assert(pca9685.sleep(link(r)))
+    r.st.insert(3, 0)
+    r.st.insert(2, 2)
+    test.assert(not pca9685.wake(link(r), true))
+
+@test
+fn test_the_software_reset_is_the_general_call_with_byte_6() [io]
+    let c = awake()
+    let l = link(c)
+    test.assert(pca9685.channel_duty(l, 0, 500))
+    log_clear(c)
+    test.assert(pca9685.software_reset(l))
+    test.assert(log_is(c, [4, 6]))
+    // Every register is back at its power-up value, auto-increment off.
+    test.assert_eq(reg(c, 0), 0x11)
+    test.assert_eq(off_of(c, 0), 0x1000)
+    // No part on the bus: no acknowledge.
+    c.st.insert(1, 0)
+    test.assert(not pca9685.software_reset(l))
+
+@test
+fn test_the_output_enable_pin_is_active_low() [io]
+    let c = awake()
+    test.assert(pca9685.output_enable(link_oe(c), true))
+    test.assert(pca9685.output_enable(link_oe(c), false))
+    test.assert(log_is(c, [5, 22, 0, 5, 22, 1]))
+    // A wiring with no OE pin.
+    log_clear(c)
+    test.assert(not pca9685.output_enable(link(c), true))
+    test.assert(log_is(c, []))
+
+@test
+fn test_the_extra_addresses_are_configuration() [io]
+    let c = awake()
+    let l = link(c)
+    // The all-call address is stored in the upper seven bits.
+    test.assert(pca9685.set_allcall_address(l, 0x55))
+    test.assert_eq(reg(c, 5), 0xAA)
+    test.assert_eq(pca9685.allcall_address(l) ?? -1, 0x55)
+    test.assert(pca9685.set_subaddress(l, 1, 0x61))
+    test.assert(pca9685.set_subaddress(l, 2, 0x62))
+    test.assert(pca9685.set_subaddress(l, 3, 0x63))
+    test.assert_eq(reg(c, 2), 0xC2)
+    test.assert_eq(reg(c, 3), 0xC4)
+    test.assert_eq(reg(c, 4), 0xC6)
+    test.assert(not pca9685.set_subaddress(l, 0, 0x61))
+    test.assert(not pca9685.set_subaddress(l, 4, 0x61))
+    // The part answers them only when asked to.
+    test.assert(not responds(c, 0x55))
+    test.assert(pca9685.set_responses(l, true, 0x2))
+    test.assert_eq(reg(c, 0), 0x20 | 0x04 | 0x01)
+    test.assert(responds(c, 0x55))
+    test.assert(responds(c, 0x62))
+    test.assert(not responds(c, 0x61))
+    test.assert(pca9685.set_responses(l, false, 0))
+    test.assert_eq(reg(c, 0), 0x20)
+    // SUB1 is bit 0 of the mask and bit 3 of MODE1; SUB3 bit 2 and bit 1.
+    test.assert(pca9685.set_responses(l, false, 1))
+    test.assert_eq(reg(c, 0), 0x28)
+    test.assert(responds(c, 0x61))
+    test.assert(not responds(c, 0x63))
+    test.assert(pca9685.set_responses(l, false, 4))
+    test.assert_eq(reg(c, 0), 0x22)
+    test.assert(responds(c, 0x63))
+    test.assert(not responds(c, 0x61))
+    test.assert(pca9685.set_responses(l, false, 0))
+    test.assert(not responds(c, 0x55))
+    c.deaf.insert(0, 1)
+    test.assert(not pca9685.set_responses(l, true, 1))
+    c.deaf.insert(5, 1)
+    test.assert(pca9685.allcall_address(l) == None)
+
+@test
+fn test_a_read_back_restart_is_never_written_back() [io]
+    // MODE1 reads RESTART as 1 while a restart is pending.  Writing the
+    // byte back with that bit set would restart the channels, so each
+    // read-modify-write of MODE1 masks it out and the bit stays pending.
+    let c = awake()
+    c.regs.insert(0, 0xA0)
+    let l = link(c)
+    test.assert(pca9685.set_responses(l, true, 1))
+    test.assert_eq(at(c.st, 5), 0)
+    test.assert_eq(reg(c, 0), 0xA9)
+    test.assert(pca9685.sleep(l))
+    test.assert_eq(at(c.st, 5), 0)
+    test.assert(pca9685.wake(l, false))
+    test.assert_eq(at(c.st, 5), 0)
+    test.assert_eq(reg(c, 0) & 0x80, 0x80)
+
+@test
+fn test_a_write_to_the_all_call_address_reaches_the_part() [io]
+    // With ALLCALL set the part acknowledges 0x70, and the framing for a
+    // part at that address is the same as for its own.
+    let c = awake()
+    c.regs.insert(0, 0x21)
+    c.regs.insert(5, 0xE0)
+    test.assert(responds(c, 0x70))
+    let l = TestLink { c: c, w: dev_bus.wiring_i2c(0, 0x70) }
+    test.assert(pca9685.channel_duty(l, 16, 500))
+    test.assert_eq(off_of(c, 5), 2048)
+
+// ── The types over the host's board handles ──────────────────────────
+
+@test
+fn test_the_part_on_a_board_answers_as_absent_hardware() [io]
+    // The host's board handles drive no hardware: every transfer is
+    // refused, so each method answers as for a part that does not
+    // acknowledge.
+    let p = Pca9685.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x40))
+    test.assert(not p.begin())
+    test.assert_eq(p.begin_with(pca9685.config_default()), -1)
+    test.assert_eq(p.set_frequency_hz(50), -1)
+    test.assert_eq(p.frequency_hz(), 0)
+    test.assert(not p.led_duty(0, 500))
+    test.assert(not p.servo_pulse_us(0, 1500))
+    test.assert(not p.pulse(0, 0, 100))
+    test.assert(not p.all_off())
+    test.assert(not p.sleep())
+    test.assert(not p.wake(true))
+    test.assert(not p.outputs(true))
+    let q = Pca9685.attach_clock(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_en(dev_bus.wiring_i2c(0, 0x41), 3), 50000000)
+    test.assert_eq(q.osc_hz, 50000000)
+    test.assert(q.outputs(true))
+    let lk = q.as_link()
+    test.assert_eq(lk.w.addr ?? -1, 0x41)
+    test.assert(not pca9685.software_reset(lk))
+    lk.link_wait(1)
+
+@test
+fn test_the_part_is_a_pwm_per_channel() [io]
+    // `Pwm`'s four methods forward to the module's functions; on the
+    // host's handles nothing answers, and they must not fail.
+    let p = Pca9685.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x40))
+    use_pwm(p)
+
+fn use_pwm<P: Pwm>(p: P) [hw]
+    p.init(0, 50)
+    p.set_duty(0, 500)
+    p.disable(0)
+    p.enable(0)

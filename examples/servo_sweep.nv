@@ -1,0 +1,63 @@
+/* servo_sweep.nv: a servo on channel 0 and an LED on channel 1 of a
+ * PCA9685, swept once every two seconds
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          pca9685-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is a PCA9685 breakout, such as Adafruit's, at its default
+ * address 0x40 on the board's first I2C bus.  SDA and SCL go to the
+ * board's I2C pins and the breakout's V+ rail powers the servo from its
+ * own 5 V supply; the breakout's OE pin is left to its pull-down, so the
+ * outputs are on.  A hobby servo is on channel 0 and an LED with its
+ * resistor on channel 1.
+ *
+ * The program sets the part to 50 Hz, the frame rate of a servo, and
+ * moves the servo between 1000 and 2000 microseconds in steps of 10 every
+ * 20 ms.  The LED's duty follows the servo's pulse, 0 to 1000 parts per
+ * thousand.  At each end of the sweep it prints the pulse over the
+ * board's UART:
+ *
+ *     end 2000
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840-DK and the nRF54LM20-DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints
+ * "pca9685: no answer" until a board package names one with
+ * `@hal(i2c)`.  The part has not been driven on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use pca9685
+use pca9685.{ Pca9685 }
+
+// The part's address with its address pins low.
+const ADDR = 0x40
+
+@tier(embedded)
+fn main() [hw]
+    let pwm = Pca9685.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    // The part is ready when the supply is up; 10 ms is ample.
+    hal.timer.delay_ms(10)
+    if pwm.begin_with(pca9685.config_at(50)) != 0
+        hal.uart.write("pca9685: no answer\n")
+        return
+    var us = 1000
+    var step = 10
+    loop
+        let _ = pwm.servo_pulse_us(0, us)
+        let _ = pwm.led_duty(1, us - 1000)
+        us = us + step
+        if us >= 2000 or us <= 1000
+            hal.uart.write("end ")
+            hal.uart.write(str.from_int(us))
+            hal.uart.write("\n")
+            step = 0 - step
+        hal.timer.delay_ms(20)
