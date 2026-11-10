@@ -27,16 +27,17 @@ controller on an I2C bus.
 - The suite runs over a double of the part and covers every line of
   `src/`.
 - The device program `examples/servo_sweep.nv`, a servo and an LED on a
-  breakout. Built for the nRF52840-DK it is 12,680 B of flash, for the
-  nRF54LM20-DK 13,524 B and for the FRDM-MCXN947 22,148 B.
+  breakout. Built for the nRF52840-DK it is 20,096 B of flash, for the
+  nRF54LM20-DK 21,072 B and for the FRDM-MCXN947 22,280 B; before the Nordic
+  buses landed, with the register paths left out, the two DK images were
+  12,680 B and 13,524 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board carries a PCA9685.
-- The device program builds for the nRF52840 DK and the nRF54LM20 DK,
-  whose board packages answer for I2C as absent hardware: on those images
-  `begin` answers `false` until the boards drive the bus. The gap is
-  tracked by `features/embedded-devex/nordic-twim-i2c-driver.md`.
+- The device program builds for the nRF52840 DK and the nRF54LM20 DK, which
+  drive I2C with TWIM0 and TWIM22, so their images carry the register paths.
+  A reply from the part over either bus is NOT VERIFIED.
 - The `Pwm` trait of embedded-hal-nv 0.3.2 has no place for what the part
   does beyond a duty: its methods answer nothing, so a refusal is not seen
   through the trait; `init` takes a frequency for one channel where the
