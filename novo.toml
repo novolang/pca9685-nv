@@ -1,6 +1,6 @@
 [package]
 name        = "pca9685-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for NXP's PCA9685 sixteen-channel, 12-bit PWM controller on an I2C bus: embedded-hal-nv's Pwm per channel, the prescale from the oscillator and the wanted frequency, the on and off counts with the full-on and full-off bits, the all-channel registers, the sleep and restart sequences, the output driver and invert bits, the sub-addresses and the all-call address, and a servo helper and an LED duty helper."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -17,7 +17,7 @@ novo        = ">= 0.24.0"
 [dependencies]
 # The board's I2C bus, GPIO and timer handles, the I2cBus, GpioOut and
 # Timer traits they implement, and the Pwm trait this driver implements.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, and the
 # register helpers.
-devices-nv      = "^0.3.2"
+devices-nv      = "^0.4.0"
