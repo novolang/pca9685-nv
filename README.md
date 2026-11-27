@@ -43,8 +43,8 @@ fn main() [hw]
     var us = 1000
     loop
         // 1000 to 2000 microseconds is the usual range of a servo.
-        let _ = pwm.servo_pulse_us(0, us)
-        let _ = pwm.led_duty(1, us - 1000)
+        pwm.servo_pulse_us(0, us)
+        pwm.led_duty(1, us - 1000)
         us = us + 10
         if us > 2000
             us = 1000

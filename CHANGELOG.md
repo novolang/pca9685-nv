@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 — 2026-11-27
+
+The README example and `examples/servo_sweep.nv` call `pwm.servo_pulse_us` and `pwm.led_duty` without a binding.  No signature of the package changed.
+
 ## 0.1.1 — 2026-11-23
 
 The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.2) and devices-nv ^0.4.0 (was ^0.3.2), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".

@@ -52,8 +52,8 @@ fn main() [hw]
     var us = 1000
     var step = 10
     loop
-        let _ = pwm.servo_pulse_us(0, us)
-        let _ = pwm.led_duty(1, us - 1000)
+        pwm.servo_pulse_us(0, us)
+        pwm.led_duty(1, us - 1000)
         us = us + step
         if us >= 2000 or us <= 1000
             hal.uart.write("end ")
